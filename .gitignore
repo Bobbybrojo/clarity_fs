@@ -1,0 +1,6 @@
+# Rust build artifacts
+clarity_be/target/
+clarity_fe/target/
+
+# macOS
+.DS_Store

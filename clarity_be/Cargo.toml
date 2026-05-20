@@ -1,0 +1,12 @@
+[package]
+name = "clarity_be"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version="1.52.3", features = ["full"] }
+tokio-tungstenite = "0.29.0"
+futures-util = { version = "0.3", default-features = false }
+uuid = { version = "1.23.1", features = ["v4", "serde"] } 
