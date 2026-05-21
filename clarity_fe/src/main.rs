@@ -1,5 +1,7 @@
 mod utility;
 mod client;
+mod peer;
+mod audio;
 
 use std::sync::Arc;
 use futures_util::{SinkExt, Stream, StreamExt};
