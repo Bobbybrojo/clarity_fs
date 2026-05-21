@@ -209,7 +209,6 @@ async fn main() -> io::Result<()> {
     for _ in 0..5 { rooms_start.push(Room { rid: Uuid::new_v4(), ..Default::default() })}
     let rooms: Rooms = Arc::new(Mutex::new(rooms_start));
 
-
     let listener: TcpListener = TcpListener::bind("localhost:7878").await?;
     loop {
         let rooms_clone: Arc<Mutex<Vec<Room>>> = rooms.clone();

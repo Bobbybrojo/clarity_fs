@@ -2,11 +2,13 @@ mod utility;
 mod client;
 
 use std::sync::Arc;
+use futures_util::{SinkExt, Stream, StreamExt};
+use iced::futures::channel::mpsc::Sender;
 use uuid::Uuid;
 use iced::Alignment::Center;
 use tokio::sync::Mutex;
 use utility::Utility;
-use client::{Client, RoomInfo};
+use client::{Client, RoomInfo, ServerMessage};
 
 use iced::{Font, Shadow, Task, Theme, Vector, window};
 use iced::Length::{Fill, FillPortion};
@@ -19,11 +21,13 @@ enum Screen {
     #[default]
     Enter,
     Menu,
+    Room,
 }
 
 struct MainState {
     screen: Screen,
     theme: Theme,
+    my_pid: Option<Uuid>,
     client: Option<Arc<Mutex<Client>>>,
     rooms: Vec<RoomInfo>,
     current_room: Uuid,
@@ -34,6 +38,7 @@ impl MainState {
         MainState {
             screen: Screen::Enter,
             theme: Theme::Dark,
+            my_pid: None,
             client: None,
             rooms: Vec::new(),
             current_room: Uuid::default(),
@@ -45,10 +50,88 @@ impl MainState {
 enum Message {
     EnterApp,
     ClientCreated(Option<Arc<Mutex<Client>>>),
-    UpdateRoomList(Option<Vec<RoomInfo>>),
+    UpdateRoomListAndPid(Option<(Vec<RoomInfo>, Uuid)>),
     JoinRoom(Uuid),
     EnterRoom(Uuid),
-    EndTasks
+
+    PeerJoined { pid: Uuid, rid: Uuid },
+    PeerLeft { pid: Uuid, rid: Uuid },
+    Signal { from: Uuid, to: Uuid, payload: String },
+    
+    CloseApp,
+    Quit,
+}
+
+
+// Allows hashing for a client for subscription building purposes
+struct ClientSubscription {
+    id: Uuid,
+    client: Arc<Mutex<Client>>,
+}
+
+impl PartialEq for ClientSubscription {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ClientSubscription {}
+
+impl std::hash::Hash for ClientSubscription {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+fn stream_subscription_builder(cs: &ClientSubscription) -> std::pin::Pin<Box<dyn Stream<Item = Message> + Send + 'static>> {
+    let client = cs.client.clone();
+
+    let stream_channel = iced::stream::channel(4096, |mut output: Sender<Message>| async move {
+            loop {
+                match {
+                    let c_guard = client.lock().await;
+                    c_guard.mpsc_receiver.recv()
+                } 
+                {
+                    Ok(msg) => {
+                        if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&msg) {
+                            let iced_msg = match server_msg {
+                                ServerMessage::PeerJoined { pid, rid } => Message::PeerJoined { pid, rid },
+                                ServerMessage::PeerLeft { pid, rid } => Message::PeerLeft { pid, rid },
+                                ServerMessage::Signal { from, to, payload } => Message::Signal { from, to, payload },
+                                _ => continue,
+                            };
+                            let _ = output.send(iced_msg).await;
+                        }
+                    }
+
+                    Err(e) => { eprintln!("Recv Error {e}") }
+                }
+            }
+        });
+
+        return stream_channel.boxed();
+
+}
+
+fn subscription(state: &MainState) -> iced::Subscription<Message> {
+
+    let events = iced::event::listen_with(|event, _, _| {
+        match event {
+            iced::Event::Window(iced::window::Event::CloseRequested) => {
+                Some(Message::CloseApp)
+            }
+            _ => None
+        }
+    });
+
+    if let Some(c) = state.client.clone() && let Some(id) = state.my_pid {
+        let client_wrapper = ClientSubscription { id, client: c };
+        return iced::Subscription::batch([iced::Subscription::run_with(client_wrapper, stream_subscription_builder), events]);
+    }
+
+    return events;
+
 }
 
 
@@ -69,18 +152,19 @@ fn update(state: &mut MainState, message: Message) -> Task<Message> {
                 async move {
                     if let Some(c) = client.clone() {
                         let c_guard = c.lock().await;
-                        Some(c_guard.rooms.clone())
+                        Some((c_guard.rooms.clone(), c_guard.id.clone()))
                     } else {
                         None
                     }
                 },
-                Message::UpdateRoomList
+                Message::UpdateRoomListAndPid
             )
         }
 
-        Message::UpdateRoomList(some_rooms) => {
-            if let Some(rooms) = some_rooms {
+        Message::UpdateRoomListAndPid(some_rooms) => {
+            if let Some((rooms, pid)) = some_rooms {
                 state.rooms = rooms;
+                state.my_pid = Some(pid);
             };
             Task::none()
         }
@@ -100,13 +184,38 @@ fn update(state: &mut MainState, message: Message) -> Task<Message> {
 
         Message::EnterRoom(rid) => {
             state.current_room = rid;
+            state.screen = Screen::Room;
             Task::none()
         }
 
-        Message::EndTasks => {
+        Message::PeerJoined { pid, rid } => {
             Task::none()
         }
 
+        Message::PeerLeft { pid, rid } => {
+            Task::none()
+        }
+
+        Message::Signal { from, to, payload } => {
+            Task::none()
+        }
+
+        Message::CloseApp => {
+            let client = state.client.clone();
+            Task::perform(
+                async move {
+                    if let Some(c) = client {
+                        let mut guard = c.lock().await;
+                        guard.close().await;
+                    }
+                },
+                |_| Message::Quit
+            )
+        }
+
+        Message::Quit => {
+            iced::exit()
+        }
 
     }
 }
@@ -167,7 +276,7 @@ fn view(state: &MainState) -> Element<'_, Message> {
                                             },
                                             ..Default::default()
                                         })
-                                        .padding(8)
+                                        .padding(12)
                                         .align_top(65)
                                         .width(iced::Length::Fill)
                                         .center_y(Fill)
@@ -175,6 +284,24 @@ fn view(state: &MainState) -> Element<'_, Message> {
                                     })
                                 )
                             )
+                        ].spacing(16).width(FillPortion(2)),
+                        column![].width(FillPortion(1)),
+                    ],
+                ].align_x(Center)
+            )
+            .padding(iced::Padding { top: 0.0, right: 12.0, bottom: 12.0, left: 12.0 } )
+            .height(Fill)
+            .into()
+        }
+
+        Screen::Room => {
+            screen_element = container(
+                column![
+                    text("Clarity").size(64),
+                    row![
+                        column![].width(FillPortion(1)),
+                        column![
+                            text(format!("Room: {}", state.current_room)),
                         ].spacing(16).width(FillPortion(2)),
                         column![].width(FillPortion(1)),
                     ],
@@ -218,6 +345,7 @@ fn view(state: &MainState) -> Element<'_, Message> {
 
 pub fn main() -> iced::Result {
     iced::application(MainState::new, update, view)
+    .subscription(subscription)
     .style(|_, _theme| iced::theme::Style{
         background_color: Utility::window_background(),
         text_color: Color::WHITE,
@@ -243,7 +371,7 @@ pub fn main() -> iced::Result {
             titlebar_transparent: true, 
             fullsize_content_view: true 
         }, 
-        exit_on_close_request: true 
+        exit_on_close_request: false 
     })
     .centered()
     .title("")
