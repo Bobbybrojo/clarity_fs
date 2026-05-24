@@ -1,10 +1,9 @@
 
 use serde::{self, Deserialize, Serialize};
-use str0m::media::{MediaTime, Frequency};
+use str0m::media::{MediaTime, Frequency, Mid};
 use str0m::net::{Protocol, Receive};
-use str0m::{Candidate, Event, IceConnectionState, Input, Output, RtcConfig};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use str0m::change::{SdpPendingOffer, SdpOffer, SdpAnswer};
-use str0m::Rtc;
 
 use uuid::Uuid;
 use std::{sync::Arc, net::SocketAddr, time::Instant};
@@ -40,10 +39,10 @@ pub enum PeerEvent {
 }
 
 pub struct PeerHandle {
-    pid: Uuid,
-    cmd_tx: mpsc::UnboundedSender<PeerTaskCmd>,
-    event_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PeerEvent>>>,
-    state: PeerState
+    pub pid: Uuid,
+    pub cmd_tx: mpsc::UnboundedSender<PeerTaskCmd>,
+    pub event_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PeerEvent>>>,
+    pub state: PeerState
 }
 
 pub fn is_offerer(pid: Uuid, remote_pid: Uuid) -> bool {
@@ -55,11 +54,12 @@ pub fn spawn_peer_task(pid: Uuid, remote_pid: Uuid, audio_rx: broadcast::Receive
     let (event_tx, event_rx) = mpsc::unbounded_channel::<PeerEvent>();
 
     let offerer = is_offerer(pid, remote_pid);
+    eprintln!("[peer-task {:.8}->{:.8}] spawn (offerer={})", pid, remote_pid, offerer);
 
     tokio::spawn(
         async move {
             if let Err(e) = run_peer_task(offerer, cmd_rx, event_tx, audio_rx).await {
-                eprintln!("[Peer {remote_pid:.8}] task error: {e}");
+                eprintln!("[peer-task {remote_pid:.8}] task error: {e}");
             }
         }
     );
@@ -102,21 +102,32 @@ mut audio_rx: broadcast::Receiver<Vec<u8>>) -> Result<(), Box<dyn std::error::Er
     rtc.add_local_candidate(ice_host_candidate);
 
 
-    let mut sdp_api = rtc.sdp_api();
-    let mid = sdp_api.add_media(str0m::media::MediaKind::Audio, str0m::media::Direction::SendRecv, Some("Mid".to_string()), None, None);
-
+    // mid is assigned by the offerer during SDP negotiation.
+    // The offerer gets it immediately from add_media(); the answerer gets it
+    // later via Event::MediaAdded once accept_offer() completes.
+    let mut mid: Option<Mid> = None;
     let mut pending_offer: Option<SdpPendingOffer> = None;
 
     if offerer {
+        let mut sdp_api = rtc.sdp_api();
+        let m = sdp_api.add_media(str0m::media::MediaKind::Audio, str0m::media::Direction::SendRecv, Some("clarity-audio".to_string()), None, None);
         if let Some((offer, pending)) = sdp_api.apply() {
-            if let Ok(ser_sdp) = serde_json::to_string(&SignalPayload::Offer {sdp: offer.to_sdp_string() }) {
+            if let Ok(ser_sdp) = serde_json::to_string(&SignalPayload::Offer { sdp: offer.to_sdp_string() }) {
+                mid = Some(m);
                 pending_offer = Some(pending);
+                eprintln!("[peer-task] (offerer) offer generated, sending SdpReady");
                 let _ = event_tx.send(PeerEvent::SdpReady(ser_sdp));
+            } else {
+                eprintln!("[peer-task] (offerer) failed to serialize offer payload");
             }
+        } else {
+            eprintln!("[peer-task] (offerer) sdp_api.apply() returned None");
         }
     } else {
-        let _ = sdp_api.apply();
+        eprintln!("[peer-task] (answerer) waiting for remote offer");
     }
+    // Answerer: do NOT call add_media/apply here. The mid will be set when
+    // Event::MediaAdded fires after accept_offer() processes the remote offer.
 
     let playback = PlaybackHandle::start().ok().unwrap();
     let mut decoder  = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)?;
@@ -145,8 +156,7 @@ mut audio_rx: broadcast::Receiver<Vec<u8>>) -> Result<(), Box<dyn std::error::Er
                     handle_rtc_event(
                         event,
                         &event_tx,
-                        &mut rtc,
-                        &mut pending_offer,
+                        &mut mid,
                         &mut decoder,
                         &mut pcm_buf,
                         &playback.buf,
@@ -181,17 +191,19 @@ mut audio_rx: broadcast::Receiver<Vec<u8>>) -> Result<(), Box<dyn std::error::Er
             frame_result = audio_rx.recv() => {
                 if let Ok(opus_bytes) = frame_result {
                     if !muted && rtc.is_connected() {
-                        if let Some(writer) = rtc.writer(mid) {
-                            // Extract pt first so the borrow from payload_params() drops
-                            // before write() consumes writer (write takes self by value)
-                            let pt = writer.payload_params().next().map(|p| p.pt());
-                            if let Some(pt) = pt {
-                                let _ = writer.write(
-                                    pt,
-                                    Instant::now(),
-                                    MediaTime::new(rtp_ts as u64, Frequency::FORTY_EIGHT_KHZ),
-                                    opus_bytes,
-                                );
+                        if let Some(m) = mid {
+                            if let Some(writer) = rtc.writer(m) {
+                                // Extract pt first so the borrow from payload_params() drops
+                                // before write() consumes writer (write takes self by value)
+                                let pt = writer.payload_params().next().map(|p| p.pt());
+                                if let Some(pt) = pt {
+                                    let _ = writer.write(
+                                        pt,
+                                        Instant::now(),
+                                        MediaTime::new(rtp_ts as u64, Frequency::FORTY_EIGHT_KHZ),
+                                        opus_bytes,
+                                    );
+                                }
                             }
                         }
                         rtp_ts = rtp_ts.wrapping_add(960);
@@ -219,18 +231,31 @@ mut audio_rx: broadcast::Receiver<Vec<u8>>) -> Result<(), Box<dyn std::error::Er
 fn handle_rtc_event(
     event: Event,
     event_tx: &mpsc::UnboundedSender<PeerEvent>,
-    _rtc: &mut Rtc,
-    _pending: &mut Option<SdpPendingOffer>,
+    mid: &mut Option<Mid>,
     decoder: &mut opus::Decoder,
     pcm_buf: &mut Vec<f32>,
     playback_buf: &AudioBuf,
 ) {
     match event {
-        Event::IceConnectionStateChange(IceConnectionState::Connected) => {
-            let _ = event_tx.send(PeerEvent::Connected);
+        Event::IceConnectionStateChange(state) => {
+            eprintln!("[peer-task] ICE state: {:?}", state);
+            match state {
+                // Both Connected and Completed mean "connection is up and usable".
+                // With host-only candidates str0m skips Connected and goes straight
+                // to Completed once the only candidate pair succeeds.
+                IceConnectionState::Connected | IceConnectionState::Completed => {
+                    let _ = event_tx.send(PeerEvent::Connected);
+                }
+                IceConnectionState::Disconnected => {
+                    let _ = event_tx.send(PeerEvent::Disconnected);
+                }
+                _ => {}
+            }
         }
-        Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-            let _ = event_tx.send(PeerEvent::Disconnected);
+        // Fired after SDP negotiation completes — this is how the answerer learns its mid
+        Event::MediaAdded(added) => {
+            eprintln!("[peer-task] MediaAdded: mid={:?}", added.mid);
+            *mid = Some(added.mid);
         }
         Event::MediaData(data) => {
             match decoder.decode_float(&data.data, pcm_buf, false) {
@@ -254,34 +279,41 @@ fn handle_remote_signal(
 ) {
     let payload: SignalPayload = match serde_json::from_str(payload_str) {
         Ok(p)  => p,
-        Err(e) => { eprintln!("[peer] bad signal payload: {e}"); return; }
+        Err(e) => { eprintln!("[peer-task] bad signal payload: {e}"); return; }
     };
 
     match payload {
         SignalPayload::Offer { sdp } => {
+            eprintln!("[peer-task] handle_remote_signal: Offer (len={})", sdp.len());
             let offer = match SdpOffer::from_sdp_string(&sdp) {
                 Ok(o)  => o,
-                Err(e) => { eprintln!("[peer] bad SDP offer: {e}"); return; }
+                Err(e) => { eprintln!("[peer-task] bad SDP offer: {e}"); return; }
             };
             match rtc.sdp_api().accept_offer(offer) {
                 Ok(answer) => {
+                    eprintln!("[peer-task] accept_offer OK, sending answer");
                     let p = SignalPayload::Answer { sdp: answer.to_sdp_string() };
                     if let Ok(s) = serde_json::to_string(&p) {
                         let _ = event_tx.send(PeerEvent::SdpReady(s));
                     }
                 }
-                Err(e) => eprintln!("[peer] accept_offer error: {e}"),
+                Err(e) => eprintln!("[peer-task] accept_offer ERROR: {e}"),
             }
         }
         SignalPayload::Answer { sdp } => {
+            eprintln!("[peer-task] handle_remote_signal: Answer (len={})", sdp.len());
             let answer = match SdpAnswer::from_sdp_string(&sdp) {
                 Ok(a)  => a,
-                Err(e) => { eprintln!("[peer] bad SDP answer: {e}"); return; }
+                Err(e) => { eprintln!("[peer-task] bad SDP answer: {e}"); return; }
             };
             if let Some(p) = pending.take() {
                 if let Err(e) = rtc.sdp_api().accept_answer(p, answer) {
-                    eprintln!("[peer] accept_answer error: {e}");
+                    eprintln!("[peer-task] accept_answer ERROR: {e}");
+                } else {
+                    eprintln!("[peer-task] accept_answer OK");
                 }
+            } else {
+                eprintln!("[peer-task] received Answer but pending_offer is None!");
             }
         }
     }

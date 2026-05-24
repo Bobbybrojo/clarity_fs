@@ -114,21 +114,33 @@ async fn process_socket(socket: TcpStream, rooms: Rooms) {
                                 }
 
                                 ClientMessage::JoinRoom {id} => {
+                                    eprintln!("[BE] JoinRoom: pid={:.8} joining room={:.8}", peer_pid, id);
                                     let mut rooms_vec = rooms.lock().await;
-                                    
+
                                     for room in rooms_vec.iter_mut() {
                                         if room.rid == id {
-                                            // Notify other peers of joined peer
-                                            let resp: ServerMessage = ServerMessage::PeerJoined { pid: peer_pid, rid: id };
-                                            let ser_resp: Result<String, serde_json::Error> = serde_json::ser::to_string(&resp);
-                                            match ser_resp {
-                                                Ok(ser) => {
-                                                    for peer in &room.peers {
-                                                        let _ = peer.sender.send(ser.clone());
-                                                    }
+                                            let existing: Vec<String> = room.peers.iter().map(|p| format!("{:.8}", p.pid)).collect();
+                                            eprintln!("[BE]   existing peers in room: {:?}", existing);
+
+                                            // Notify existing peers about the new joiner
+                                            let new_peer_msg = ServerMessage::PeerJoined { pid: peer_pid, rid: id };
+                                            if let Ok(ser) = serde_json::to_string(&new_peer_msg) {
+                                                for peer in &room.peers {
+                                                    eprintln!("[BE]   -> notifying existing {:.8} about new {:.8}", peer.pid, peer_pid);
+                                                    let _ = peer.sender.send(ser.clone());
                                                 }
-                                                Err(e) => { eprintln!("Failed to serialize message: {e}"); }
                                             }
+
+                                            // Notify the new peer about each existing peer so
+                                            // both sides can initiate their PeerTasks
+                                            for existing in &room.peers {
+                                                let existing_msg = ServerMessage::PeerJoined { pid: existing.pid, rid: id };
+                                                if let Ok(ser) = serde_json::to_string(&existing_msg) {
+                                                    eprintln!("[BE]   -> telling new {:.8} about existing {:.8}", peer_pid, existing.pid);
+                                                    let _ = peer_sender.send(ser);
+                                                }
+                                            }
+
                                             // Add peer to room
                                             room.peers.push(Peer {
                                                 pid: peer_pid,
@@ -140,6 +152,7 @@ async fn process_socket(socket: TcpStream, rooms: Rooms) {
                                 }
 
                                 ClientMessage::Signal { from, to, payload } => {
+                                    eprintln!("[BE] Signal: from={:.8} to={:.8} len={}", from, to, payload.len());
                                     let resp = ServerMessage::Signal { from, to, payload };
                                     if let Ok(ser) = serde_json::to_string(&resp) {
                                         let rooms_vec = rooms.lock().await;
