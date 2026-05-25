@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 enum ClientMessage {
     ListRoomsReq,
     JoinRoom { id: Uuid },
+    LeaveRoom,
     Signal { from: Uuid, to: Uuid, payload: String },
 }
 
@@ -147,6 +148,36 @@ async fn process_socket(socket: TcpStream, rooms: Rooms) {
                                                 sender: peer_sender.clone(),
                                             });
                                             break;
+                                        }
+                                    }
+                                }
+
+                                ClientMessage::LeaveRoom => {
+                                    eprintln!("[BE] LeaveRoom: pid={:.8}", peer_pid);
+                                    let mut rooms_vec = rooms.lock().await;
+
+                                    // Find which room this peer is in
+                                    let mut found: Option<(usize, usize)> = None;
+                                    'outer: for (r_idx, room) in rooms_vec.iter().enumerate() {
+                                        for (p_idx, p) in room.peers.iter().enumerate() {
+                                            if p.pid == peer_pid {
+                                                found = Some((r_idx, p_idx));
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
+
+                                    if let Some((r_idx, p_idx)) = found {
+                                        let room = &mut rooms_vec[r_idx];
+                                        let rid = room.rid;
+                                        room.peers.remove(p_idx);
+
+                                        let resp = ServerMessage::PeerLeft { pid: peer_pid, rid };
+                                        if let Ok(ser) = serde_json::to_string(&resp) {
+                                            for peer in &room.peers {
+                                                eprintln!("[BE]   -> notifying {:.8} that {:.8} left", peer.pid, peer_pid);
+                                                let _ = peer.sender.send(ser.clone());
+                                            }
                                         }
                                     }
                                 }

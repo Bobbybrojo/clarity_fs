@@ -37,6 +37,10 @@ struct MainState {
     peers: std::collections::HashMap<Uuid, peer::PeerHandle>,
     pending_peers: Vec<Uuid>,
     is_muted: bool,
+    // audio_capture owns the mic thread + cpal stream. Dropping it triggers shutdown
+    // via the Drop impl. audio_tx is a clone of the broadcast sender for convenience
+    // (PeerJoined uses it without needing to reach through audio_capture).
+    audio_capture: Option<audio::AudioCapture>,
     audio_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 }
 
@@ -52,6 +56,7 @@ impl MainState {
             peers: std::collections::HashMap::new(),
             pending_peers: Vec::new(),
             is_muted: false,
+            audio_capture: None,
             audio_tx: None,
         }
     }
@@ -64,7 +69,7 @@ enum Message {
     UpdateRoomListAndPid(Option<(Vec<RoomInfo>, Uuid)>),
     JoinRoom(Uuid),
     EnterRoom(Uuid),
-    RoomJoined { rid: Uuid, audio_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>> },
+    RoomJoined(Uuid),
 
     PeerJoined { pid: Uuid, rid: Uuid },
     PeerLeft { pid: Uuid, rid: Uuid },
@@ -241,39 +246,46 @@ fn update(state: &mut MainState, message: Message) -> Task<Message> {
         }
 
         Message::JoinRoom(rid) => {
+            // Start AudioCapture synchronously BEFORE sending the join request.
+            // start() spawns its own thread and returns quickly; we keep both
+            // the AudioCapture (owns the mic thread, Drop signals shutdown) and
+            // a clone of the broadcast sender (for PeerTask subscriptions).
+            match audio::AudioCapture::start() {
+                Ok(capture) => {
+                    state.audio_tx = Some(capture.tx.clone());
+                    state.audio_capture = Some(capture);
+                }
+                Err(e) => {
+                    eprintln!("[FE] AudioCapture::start failed: {e} — joining without outgoing audio");
+                    state.audio_tx = None;
+                    state.audio_capture = None;
+                }
+            }
+
             let client = state.client.clone();
             Task::perform(
                 async move {
-                    // Start AudioCapture BEFORE sending the join request.
-                    // This ensures audio_tx is stored in state before the server
-                    // has a chance to send PeerJoined messages back. If AudioCapture
-                    // fails (no mic / permissions) we still join — just no outgoing audio.
-                    let audio_tx = audio::AudioCapture::start().map(|a| a.tx).ok();
                     if let Some(c) = client {
                         let mut c_guard = c.lock().await;
                         c_guard.join_room(rid).await;
                     }
-                    (rid, audio_tx)
+                    rid
                 },
-                |(rid, audio_tx)| Message::RoomJoined { rid, audio_tx }
+                Message::RoomJoined
             )
         }
 
-        // RoomJoined fires after AudioCapture is ready AND the join request has been sent.
-        // PeerJoined messages and RoomJoined race in Iced's queue, so we must drain
-        // pending_peers here too (not just in AudioCaptureReady, which the new JoinRoom
-        // flow no longer fires).
-        Message::RoomJoined { rid, audio_tx } => {
+        // RoomJoined fires after the join request has been sent. audio_tx is already
+        // set (synchronously in JoinRoom), so PeerJoined messages that arrived during
+        // the WebSocket round-trip should already have spawned tasks. pending_peers
+        // drain is kept as a safety net for any edge cases.
+        Message::RoomJoined(rid) => {
             let my_pid_short = state.my_pid.map(|p| format!("{:.8}", p)).unwrap_or_default();
-            eprintln!("[FE-{my_pid_short}] RoomJoined: audio_tx={}, pending_peers={}",
-                if audio_tx.is_some() { "Some" } else { "None" },
-                state.pending_peers.len());
+            eprintln!("[FE-{my_pid_short}] RoomJoined: pending_peers={}", state.pending_peers.len());
 
-            state.audio_tx = audio_tx;
             state.current_room = rid;
             state.screen = Screen::Room;
 
-            // Drain any peers that arrived before audio_tx was set
             if let (Some(my_pid), Some(audio_tx)) = (state.my_pid, &state.audio_tx) {
                 for pid in state.pending_peers.drain(..) {
                     eprintln!("[FE-{my_pid_short}] RoomJoined: draining pending peer {:.8}", pid);
@@ -379,9 +391,25 @@ fn update(state: &mut MainState, message: Message) -> Task<Message> {
             }
             state.peers.clear();
             state.pending_peers.clear();
+            // Drop audio_capture → Drop impl signals shutdown → mic thread exits,
+            // cpal stream dropped, microphone released.
+            state.audio_capture = None;
             state.audio_tx = None;
             state.screen = Screen::Menu;
-            Task::none()
+
+            // Tell the server we're leaving so it removes us from the room
+            // and notifies remaining peers. Without this, the server only learns
+            // we left when the WebSocket closes (i.e., when we quit the app).
+            let client = state.client.clone();
+            Task::perform(
+                async move {
+                    if let Some(c) = client {
+                        let mut guard = c.lock().await;
+                        guard.leave_room().await;
+                    }
+                },
+                |_| Message::Noop,
+            )
         }
 
         Message::Noop => Task::none(),

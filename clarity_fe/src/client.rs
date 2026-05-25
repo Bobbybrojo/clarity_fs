@@ -15,6 +15,7 @@ use uuid::Uuid;
 enum ClientMessage {
     ListRoomsReq,
     JoinRoom { id: Uuid },
+    LeaveRoom,
     Signal { from: Uuid, to: Uuid, payload: String },
 }
 
@@ -77,6 +78,13 @@ impl Client {
 
     pub async fn join_room(&mut self, rid: Uuid) {
         let req: ClientMessage = ClientMessage::JoinRoom { id: rid };
+        if let Ok(ser_req) = serde_json::ser::to_string(&req) {
+            let _ = self.sender.send(tungstenite::Message::Text(ser_req.into())).await;
+        }
+    }
+
+    pub async fn leave_room(&mut self) {
+        let req: ClientMessage = ClientMessage::LeaveRoom;
         if let Ok(ser_req) = serde_json::ser::to_string(&req) {
             let _ = self.sender.send(tungstenite::Message::Text(ser_req.into())).await;
         }
