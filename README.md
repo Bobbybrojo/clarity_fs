@@ -4,21 +4,8 @@ Real-time peer-to-peer voice chat in Rust. Up to 5 peers per room, audio over di
 
 ## Demo
 
-<!--
-  To embed a real video (not a GIF):
+https://github.com/user-attachments/assets/b307e6ea-c421-4e71-9152-8d2f1523a717
 
-  Option A — drag and drop (easiest):
-    Edit this README on github.com, drag your .mp4/.mov into the editor.
-    GitHub uploads it to user-attachments and inserts a link that renders
-    as a video player with controls and audio. Replace the block below
-    with the generated markdown.
-
-  Option B — HTML video tag pointing at any direct URL:
-    Commit the video to the repo (or upload as a release asset), then
-    set the src below to the raw URL. Works on github.com.
--->
-
-<video src="https://user-images.githubusercontent.com/REPLACE_ME/demo.mp4" controls width="720"></video>
 
 ## What it is
 
